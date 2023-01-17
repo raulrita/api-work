@@ -1,0 +1,20 @@
+{
+    "version": "2.0.0",
+    "cwd": "${workspaceFolder}",
+    "tasks": [
+        {
+            "label": "build",
+            "command": "go",
+            "args": ["run", "${workspaceRoot}"],
+            "group": "build",
+            "type": "shell",
+        },
+        {
+            "label": "test",
+            "command": "go",
+            "args": ["test", "-v", "./..."],
+            "group": "test",
+            "type": "shell",
+        },
+    ],
+}
