@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"net/http"
+	"os"
 	"reflect"
 	"regexp"
 	"strings"
@@ -29,7 +31,7 @@ const (
 
 const (
 	EMPTY ContentType = ""
-	JSON  ContentType = "application/json"
+	JSON  ContentType = "application/json; charset=utf-8"
 	TEXT  ContentType = "text/plain; charset=utf-8"
 )
 
@@ -47,9 +49,36 @@ type Route struct {
 	handler http.HandlerFunc
 }
 
-var sampleSecretKey = []byte("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJSb2xlIjoiZmFsc2UiLCJVc2VybmFtZSI6ImFkbWluIiwiYXV0aG9yaXplZCI6dHJ1ZSwiZXhwIjoiMjAyMy0wMS0xNFQxOTo1MzowMy4zMDU2MTJaIn0.btpfbe-q1zJ6Cu21k3FqsXoGEGz2PiIMJltkEIK51F") // move to config
+type serverConfig struct {
+	allowedHosts []string
+	secretKey    []byte
+}
 
-func NewServer(port int, routes []Route) error {
+var server serverConfig
+
+func NewServer(routes []Route) error {
+	accessFile, err := os.Open("./config.json")
+	if err != nil {
+		return err
+	}
+	defer accessFile.Close()
+
+	jsonFile, err := ioutil.ReadAll(accessFile)
+	if err != nil {
+		return err
+	}
+
+	var result map[string]interface{}
+	json.Unmarshal([]byte(jsonFile), &result)
+
+	server.secretKey = []byte(result["server_secret_key"].(string))
+	server.allowedHosts = strings.Split(result["server_allowed_hosts"].(string), ",")
+	port := int(result["server_port"].(float64))
+
+	if len(os.Getenv("API_WORK")) > 0 {
+		server.allowedHosts = append(server.allowedHosts, "http://localhost:8082")
+	}
+
 	listenAddr := fmt.Sprintf(":%d", port)
 	handler := http.HandlerFunc(makeHandler(routes))
 	return http.ListenAndServe(listenAddr, handler)
@@ -63,7 +92,13 @@ func makeHandler(routes []Route) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var allow []string
 
-		w.Header().Set("Access-Control-Allow-Origin", "*") // TODO
+		origin := r.Header.Get("Origin")
+		if !contains(server.allowedHosts, origin) {
+			Respond(w, http.StatusForbidden, EMPTY, nil)
+			return
+		} else {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+		}
 
 		for i, route := range routes {
 			if route.method == LIST {
@@ -119,11 +154,11 @@ func makeHandler(routes []Route) http.HandlerFunc {
 // Response helpers
 
 func Respond(w http.ResponseWriter, status int, contentType ContentType, output any) {
-	w.WriteHeader(status)
-
 	if contentType != EMPTY {
 		w.Header().Set("Content-Type", string(contentType))
 	}
+
+	w.WriteHeader(status)
 
 	if output != nil {
 		json.NewEncoder(w).Encode(&output)
@@ -168,13 +203,13 @@ func ReadQueryParam(r *http.Request, index int) string {
 // JWT
 
 func Autorize(username string, role string) (string, error) {
-	token := jwt.New(jwt.SigningMethodHS256)
-	claims := token.Claims.(jwt.MapClaims)
-	claims["exp"] = time.Now().Add(24 * time.Hour)
-	claims["authorized"] = true
-	claims[USER] = username
-	claims[ROLE] = role
-	tokenString, err := token.SignedString(sampleSecretKey)
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		USER:  username,
+		ROLE:  role,
+		"exp": time.Now().Add(24 * time.Hour).Unix(),
+	})
+
+	tokenString, err := token.SignedString(server.secretKey)
 	if err != nil {
 		return "Signing Error", err
 	}
@@ -185,31 +220,37 @@ func Autorize(username string, role string) (string, error) {
 func Auth(r *http.Request) (string, string, error) {
 	if r.Header["Authorization"] != nil && len(r.Header["Authorization"]) == 1 && strings.Contains(r.Header["Authorization"][0], "Bearer ") {
 		bearer := strings.Split(r.Header["Authorization"][0], " ")[1]
-		var keyfunc jwt.Keyfunc = func(token *jwt.Token) (interface{}, error) {
-			return sampleSecretKey, nil
-		}
-		token, _ := jwt.Parse(bearer, keyfunc)
-		/*	 	if err != nil {
-			log.Fatalf("Failed to parse JWT.\nError: %s", err.Error())
-		}
-
-		if !token.Valid {
-			log.Fatalln("Token is not valid.")
-		}
-
-		log.Println("Token is valid.")
+		token, err := jwt.Parse(bearer, func(token *jwt.Token) (interface{}, error) {
+			// Don't forget to validate the alg is what you expect:
+			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+			}
+			return server.secretKey, nil
+		})
 
 		if err != nil {
-			return "Error Parsing Token: ", "", err
+			return "", "", err
 		}
-		*/
-		claims, ok := token.Claims.(jwt.MapClaims)
-		if ok { // && token.Valid {
-			username := claims[USER].(string)
-			role := claims[ROLE].(string)
-			return username, role, nil
+
+		if token.Valid {
+			claims, ok := token.Claims.(jwt.MapClaims)
+			if ok {
+				username := claims[USER].(string)
+				role := claims[ROLE].(string)
+				return username, role, nil
+			}
 		}
 	}
 
-	return "Error Parsing Token: ", "", errors.New("no token/error parsing token")
+	return "", "", errors.New("no token/error parsing token")
+}
+
+func contains(s []string, str string) bool {
+	for _, v := range s {
+		if v == str {
+			return true
+		}
+	}
+
+	return false
 }

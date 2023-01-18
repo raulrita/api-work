@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/firestore"
-	"google.golang.org/api/iterator"
+	"cloud.google.com/go/firestore/apiv1/firestorepb"
 	"google.golang.org/api/option"
 )
 
@@ -88,25 +88,6 @@ type ResultList[T Model] struct {
 
 var storage *firestore.Client
 
-func getCredentials() (option.ClientOption, string, error) {
-	accessFile, err := os.Open("./config.json")
-	if err != nil {
-		return nil, "", err
-	}
-	defer accessFile.Close()
-
-	jsonFile, err := ioutil.ReadAll(accessFile)
-	if err != nil {
-		return nil, "", err
-	}
-
-	var result map[string]interface{}
-	json.Unmarshal([]byte(jsonFile), &result)
-	projectId := result["project_id"].(string)
-
-	return option.WithCredentialsJSON(jsonFile), projectId, nil
-}
-
 func NewFireStore() {
 	ctx := context.Background()
 
@@ -155,34 +136,9 @@ func StorageCount[T Model](filters []Filter) int {
 	var entity T
 
 	collection := storage.Collection(string(entity.Collection()))
-	query := collection.Query
+	query := filter(collection.Query, filters)
 
-	for _, f := range filters {
-		switch f.Type {
-		case BOOLEAN:
-			value, err := strconv.ParseBool(f.Value)
-			if err == nil {
-				query = query.Where(f.Field, string(f.Operator), value)
-			}
-		case NUMBER:
-			value, err := strconv.ParseFloat(f.Value, 64)
-			if err == nil {
-				query = query.Where(f.Field, string(f.Operator), value)
-			}
-		case DATE:
-			value, err := time.Parse("2006-01-02", f.Value)
-			if err == nil {
-				query = query.Where(f.Field, string(f.Operator), value)
-			}
-		default:
-			query = query.Where(f.Field, string(f.Operator), f.Value)
-		}
-	}
-
-	snap, _ := query.Documents(context.Background()).GetAll()
-	count := len(snap)
-
-	return count
+	return count(query)
 }
 
 func StorageSync[T Model](entity T) error {
@@ -196,33 +152,11 @@ func StorageSync[T Model](entity T) error {
 	return nil
 }
 
-func StorageSyncList[T Model](payload Payload, field string, value string) {
+func StorageSyncList[T Model](filters []Filter, field string, value string) {
 	var entity T
 
 	collection := storage.Collection(string(entity.Collection()))
-	query := collection.Query
-
-	for _, f := range payload.Filters {
-		switch f.Type {
-		case BOOLEAN:
-			value, err := strconv.ParseBool(f.Value)
-			if err == nil {
-				query = query.Where(f.Field, string(f.Operator), value)
-			}
-		case NUMBER:
-			value, err := strconv.ParseFloat(f.Value, 64)
-			if err == nil {
-				query = query.Where(f.Field, string(f.Operator), value)
-			}
-		case DATE:
-			value, err := time.Parse("2006-01-02", f.Value)
-			if err == nil {
-				query = query.Where(f.Field, string(f.Operator), value)
-			}
-		default:
-			query = query.Where(f.Field, string(f.Operator), f.Value)
-		}
-	}
+	query := filter(collection.Query, filters)
 
 	snap, _ := query.Documents(context.Background()).GetAll()
 	count := len(snap)
@@ -231,15 +165,7 @@ func StorageSyncList[T Model](payload Payload, field string, value string) {
 	}
 
 	batch := storage.Batch()
-	iter := query.Documents(context.Background())
-	defer iter.Stop()
-
-	for {
-		doc, err := iter.Next()
-		if doc == nil || err == iterator.Done {
-			break
-		}
-
+	for _, doc := range snap {
 		batch.Set(doc.Ref, map[string]interface{}{
 			field: value,
 		}, firestore.MergeAll)
@@ -266,40 +192,18 @@ func StorageList[T Model](payload Payload) ResultList[T] {
 	var entity T
 
 	collection := storage.Collection(string(entity.Collection()))
-	query := collection.Query
+	query := filter(collection.Query, payload.Filters)
 
-	for _, f := range payload.Filters {
-		switch f.Type {
-		case BOOLEAN:
-			value, err := strconv.ParseBool(f.Value)
-			if err == nil {
-				query = query.Where(f.Field, string(f.Operator), value)
-			}
-		case NUMBER:
-			value, err := strconv.ParseFloat(f.Value, 64)
-			if err == nil {
-				query = query.Where(f.Field, string(f.Operator), value)
-			}
-		case DATE:
-			value, err := time.Parse("2006-01-02", f.Value)
-			if err == nil {
-				query = query.Where(f.Field, string(f.Operator), value)
-			}
-		default:
-			query = query.Where(f.Field, string(f.Operator), f.Value)
+	count := count(query)
+
+	if count == 0 {
+		return ResultList[T]{
+			Count: 0,
+			Data:  result,
 		}
 	}
 
-	snap, _ := query.Documents(context.Background()).GetAll()
-	count := len(snap)
-
-	for _, o := range payload.Orders {
-		sort := firestore.Asc
-		if o.Descending {
-			sort = firestore.Desc
-		}
-		query = query.OrderBy(o.Field, sort)
-	}
+	query = order(query, payload.Orders)
 
 	if payload.PageSize > 0 {
 		query = query.Limit(payload.PageSize)
@@ -309,17 +213,10 @@ func StorageList[T Model](payload Payload) ResultList[T] {
 		query = query.Offset(payload.Page * payload.PageSize)
 	}
 
-	iter := query.Documents(context.Background())
-	defer iter.Stop()
-
-	for {
-		doc, err := iter.Next()
-		if doc == nil || err == iterator.Done {
-			break
-		}
-
+	snap, _ := query.Documents(context.Background()).GetAll()
+	for _, doc := range snap {
 		var entity T
-		err = doc.DataTo(&entity)
+		err := doc.DataTo(&entity)
 		if err != nil {
 			log.Println(err)
 			continue
@@ -338,8 +235,83 @@ func StorageSum[T Model](filters []Filter, field string) float64 {
 	var entity T
 
 	collection := storage.Collection(string(entity.Collection()))
-	query := collection.Query
+	query := filter(collection.Query, filters)
 
+	snap, _ := query.Documents(context.Background()).GetAll()
+	count := len(snap)
+	if count == 0 {
+		return 0
+	}
+
+	sum := float64(0)
+
+	for _, doc := range snap {
+		v := doc.Data()[field]
+		str := fmt.Sprintf("%v", v)
+		v2, err := strconv.ParseFloat(str, 64)
+		if err == nil {
+			sum += v2
+		}
+	}
+
+	return sum
+}
+
+// ////////////////////////////////////////////////////////////////////////////
+// util
+
+func searchify(terms []string) []string {
+	list := []string{}
+	for _, item := range terms {
+		if len(item) > 0 {
+			item = strings.ToLower(item)
+			list = append(list, item)
+
+			// Convert to rune slice for substrings.
+			runes := []rune(item)
+
+			// Loop over possible lengths, and possible start indexes.
+			// ... Then take each possible substring from the source string.
+			for length := 2; length < len(runes); length++ {
+				for start := 0; start <= len(runes)-length; start++ {
+					substring := string(runes[start : start+length])
+					list = append(list, substring)
+				}
+			}
+		}
+	}
+
+	return list
+}
+
+func getCredentials() (option.ClientOption, string, error) {
+	accessFile, err := os.Open("./config.json")
+	if err != nil {
+		return nil, "", err
+	}
+	defer accessFile.Close()
+
+	jsonFile, err := ioutil.ReadAll(accessFile)
+	if err != nil {
+		return nil, "", err
+	}
+
+	var result map[string]interface{}
+	json.Unmarshal([]byte(jsonFile), &result)
+	projectId := result["project_id"].(string)
+
+	return option.WithCredentialsJSON(jsonFile), projectId, nil
+}
+
+func count(query firestore.Query) int {
+	q := query.NewAggregationQuery().WithCount("count")
+	r, _ := q.Get(context.Background())
+	i := r["count"].(firestorepb.Value)
+
+	return int(i.GetIntegerValue())
+}
+
+func filter(query firestore.Query, filters []Filter) firestore.Query {
 	for _, f := range filters {
 		switch f.Type {
 		case BOOLEAN:
@@ -362,55 +334,17 @@ func StorageSum[T Model](filters []Filter, field string) float64 {
 		}
 	}
 
-	snap, _ := query.Documents(context.Background()).GetAll()
-	count := len(snap)
-	if count == 0 {
-		return 0
-	}
-
-	iter := query.Documents(context.Background())
-	defer iter.Stop()
-
-	sum := float64(0)
-
-	for {
-		doc, err := iter.Next()
-		if doc == nil || err == iterator.Done {
-			break
-		}
-
-		v := doc.Data()[field]
-		str := fmt.Sprintf("%v", v)
-		v2, err := strconv.ParseFloat(str, 64)
-		if err == nil {
-			sum += v2
-		}
-	}
-
-	return sum
+	return query
 }
 
-// ////////////////////////////////////////////////////////////////////////////
-// utils
-func searchify(terms []string) []string {
-	list := []string{}
-	for _, item := range terms {
-		if len(item) > 0 {
-			item = strings.ToLower(item)
-			list = append(list, item)
-
-			// Convert to rune slice for substrings.
-			runes := []rune(item)
-
-			// Loop over possible lengths, and possible start indexes.
-			// ... Then take each possible substring from the source string.
-			for length := 2; length < len(runes); length++ {
-				for start := 0; start <= len(runes)-length; start++ {
-					substring := string(runes[start : start+length])
-					list = append(list, substring)
-				}
-			}
+func order(query firestore.Query, orders []Order) firestore.Query {
+	for _, o := range orders {
+		sort := firestore.Asc
+		if o.Descending {
+			sort = firestore.Desc
 		}
+		query = query.OrderBy(o.Field, sort)
 	}
-	return list
+
+	return query
 }
