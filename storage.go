@@ -306,7 +306,7 @@ func getCredentials() (option.ClientOption, string, error) {
 func count(query firestore.Query) int {
 	q := query.NewAggregationQuery().WithCount("count")
 	r, _ := q.Get(context.Background())
-	i := r["count"].(firestorepb.Value)
+	i := r["count"].(*firestorepb.Value)
 
 	return int(i.GetIntegerValue())
 }
